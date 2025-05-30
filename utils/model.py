@@ -679,7 +679,7 @@ class EDITS(nn.Module):
         self.optimizer_feature_l1.zero_grad()
         self.optimizer_feature_l1.step()
 
-        _, X_debiased, predictor_sens, _, _ = self.forward(adj, features)
+        predictor_sens, _, X_debiased, _ = self.forward(adj, features)
         pos = torch.masked_select(predictor_sens[idx_train].squeeze(), sens[idx_train] > 0)
         neg = torch.masked_select(predictor_sens[idx_train].squeeze(), sens[idx_train] <= 0)
         adv_loss = - (torch.mean(pos) - torch.mean(neg))
@@ -693,7 +693,7 @@ class EDITS(nn.Module):
         for _ in range(8):
             self.fc.requires_grad_(True)
             self.optimizer_A.zero_grad()
-            _, _, predictor_sens, _, _ = self.forward(adj, features)
+            predictor_sens, _, _, _ = self.forward(adj, features)
             pos = torch.masked_select(predictor_sens[idx_train].squeeze(), sens[idx_train] > 0)
             neg = torch.masked_select(predictor_sens[idx_train].squeeze(), sens[idx_train] <= 0)
             loss_train = torch.abs(torch.mean(pos) - torch.mean(neg))
@@ -793,13 +793,18 @@ class GroupWiseNorm(nn.Module):
         return mean_diff + var_diff
 
 class FnRGNN(nn.Module):
-    def __init__(self, nfeat, hidden_dim, dropout, lm, ld, mmd_sample, lr, weight_decay):
+    def __init__(self, nfeat, hidden_dim, dropout, lm, ld, mmd_sample, lr, weight_decay,
+                 use_mmd=True, use_gwn=True, use_edge_weight=True):
         super(FnRGNN, self).__init__()
         self.hidden_dim = hidden_dim
         self.dropout = dropout
         self.lambda2 = lm
         self.lambda_dist = ld
         self.mmd_sample_size = mmd_sample
+
+        self.use_mmd = use_mmd
+        self.use_gwn = use_gwn
+        self.use_edge_weight = use_edge_weight
 
         self.gcn1 = GCNConv(nfeat, hidden_dim)
         self.gcn2 = GCNConv(hidden_dim, hidden_dim)
@@ -843,8 +848,10 @@ class FnRGNN(nn.Module):
 
         num_edges = edge_index.size(1)
         edge_weight = torch.ones(num_edges, device=x.device)
-        sen_diff = sensitive_attr[edge_index[0]] != sensitive_attr[edge_index[1]]
-        edge_weight[sen_diff] *= 0.5  # 민감 속성 다른 엣지 가중치 감소
+
+        if self.use_edge_weight:
+            sen_diff = sensitive_attr[edge_index[0]] != sensitive_attr[edge_index[1]]
+            edge_weight[sen_diff] *= 0.5  # 민감 속성 다른 엣지 가중치 감소
 
         h = self.gcn1(x, edge_index, edge_weight=edge_weight)
         h = F.relu(h)
@@ -856,16 +863,19 @@ class FnRGNN(nn.Module):
         return y, h
 
     def optimize(self, data):
-        labels, idx_train, sensitive_attr = (data.y, data.idx_train, data.sensitive_attr)
         self.train()
-        self.optimizer.zero_grad()
-        
         y, h= self.forward(data)
-        task_loss = self.criterion(y[idx_train], labels[idx_train].unsqueeze(1).float())  # mse
-        mmd_loss = self.compute_mmd(h, sensitive_attr)  # mmd
-        dist_loss = self.group_norm(y, sensitive_attr)  # mean + var diff
+        sensitive_attr =  data.sensitive_attr
+        target = data.y.view(-1, 1)
+
+        mse_loss = self.criterion(y, target)  # mse
+        mmd_loss = self.compute_mmd(h, sensitive_attr) if self.use_mmd else torch.tensor(0.0, device=h.device) # mmd
+        gwn_loss  = self.group_norm(y, sensitive_attr) if self.use_gwn else torch.tensor(0.0, device=h.device) # mean + var diff
         
-        total_loss = task_loss + self.lambda2 * mmd_loss + self.lambda_dist * dist_loss
+        total_loss = mse_loss + self.lambda2 * mmd_loss + self.lambda_dist * gwn_loss 
+        
+        self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
+
         return total_loss.item()

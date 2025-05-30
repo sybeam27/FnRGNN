@@ -67,11 +67,12 @@ def group_distribution_metrics(y_true_np, y_pred_np, sensitive_attr_np, bins=50,
     for m in metrics:
         try:
             diff = abs(group_metrics["group_0"][m] - group_metrics["group_1"][m])
-            results[f"{m}_diff"] = diff
+            results[f"{m}"] = diff
             results[f"{m}_g0"] = group_metrics["group_0"][m]
             results[f"{m}_g1"] = group_metrics["group_1"][m]
         except KeyError as e:
             raise KeyError(f"그룹별 지표 계산 중 '{e}' 누락. 현재 그룹들: {group_metrics.keys()}")
+        
     return results
 
 def fair_metric(output, labels, sens, idx):
@@ -164,7 +165,12 @@ def fair_metric_regression(output, labels, sens):
     mean_g1 = y_g1.mean().item() if len(y_g1) > 0 else 0.0
     mean_diff = abs(mean_g0 - mean_g1)
     
-    return mse_diff, mae_diff, mean_diff
+    # 그룹별 분산 차이
+    var_g0 = np.var(y_g0.cpu().numpy()) if len(y_g0) > 0 else 0.0
+    var_g1 = np.var(y_g1.cpu().numpy()) if len(y_g1) > 0 else 0.0
+    var_diff = abs(var_g0 - var_g1)
+
+    return mse_diff, mae_diff, mean_diff, var_diff
 
 def output_fairness(preds, sens):
     p0 = preds[sens == 0].cpu().numpy()
