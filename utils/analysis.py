@@ -1,6 +1,7 @@
 import numpy as np
 import networkx as nx
 import scipy.sparse as sp
+import matplotlib.pyplot as plt
 
 from torch_geometric.utils import degree
 from scipy.stats import wasserstein_distance
@@ -91,3 +92,56 @@ def analyze_structural_bias_with_tests(data, df, sens_attr='sens', y_col='y', y_
         'p_levene_error_var': p_levene,
         'p_ks_pred_dist': p_ks
     }
+
+def plot_all_runs(logs, ds_name):
+    plt.figure(figsize=(5, 3))
+    for run_id, run_log in logs[ds_name].items():
+        val_scores = run_log['val_score']
+        plt.plot(range(len(val_scores)), val_scores, label=f'Run {run_id}')
+    
+    plt.title(f"Validation Score (MSE + Wasserstein) for Dataset: {ds_name}")
+    plt.xlabel("Epoch")
+    plt.ylabel("Validation Score")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def plot_total_loss_all_runs(logs, ds_name):
+    plt.figure(figsize=(5, 3))
+    for run_id, run_log in logs[ds_name].items():
+        total_losses = run_log['train_loss']['total']
+        plt.plot(range(len(total_losses)), total_losses, label=f'Run {run_id}')
+    
+    plt.title(f"Training Total Loss for Dataset: {ds_name}")
+    plt.xlabel("Epoch")
+    plt.ylabel("Total Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def plot_all_metrics(logs, ds_name):
+    fig, axs = plt.subplots(1, 2, figsize=(8, 4))
+
+    for run_id, run_log in logs[ds_name].items():
+        val_scores = run_log['val_score']
+        total_losses = run_log['train_loss']['total']
+        axs[0].plot(range(len(total_losses)), total_losses, label=f'Run {run_id}')
+        axs[1].plot(range(len(val_scores)), val_scores, label=f'Run {run_id}')
+    
+    axs[0].set_title(f"Total Training Loss - {ds_name}")
+    axs[0].set_xlabel("Epoch")
+    axs[0].set_ylabel("Total Loss")
+    axs[0].grid(True)
+    axs[0].legend()
+
+    axs[1].set_title(f"Validation Score (MSE + Wasserstein) - {ds_name}")
+    axs[1].set_xlabel("Epoch")
+    axs[1].set_ylabel("Val Score")
+    axs[1].grid(True)
+    axs[1].legend()
+
+    plt.tight_layout()
+    plt.show()
+

@@ -13,6 +13,7 @@ from torch import nn
 from torch import Tensor
 from scipy import sparse
 from typing import Optional
+from geomloss import SamplesLoss
 from torch.nn.parameter import Parameter
 from torch_geometric.typing import OptTensor
 from torch_sparse import SparseTensor, matmul
@@ -777,28 +778,14 @@ class GINRegressor(nn.Module):
         return self.out(x).squeeze(-1)
 
 #FnR-GNN
-class GroupWiseNorm(nn.Module):
-    def __init__(self):
-        super(GroupWiseNorm, self).__init__()
-
-    def forward(self, pred, sensitive_attr):
-        # 민감 속성 그룹 간 분포가 다르다는 것은 bias가 있을 수 있다는 뜻이고, 이를 fairness 관점에서 줄이려는 것
-        # 두 그룹의 representation의 분포를 가깝게
-        mask_0 = (sensitive_attr == 0).squeeze()
-        mask_1 = (sensitive_attr == 1).squeeze()
-        pred_0 = pred[mask_0]
-        pred_1 = pred[mask_1]
-        mean_diff = torch.abs(pred_0.mean() - pred_1.mean()) if pred_0.numel() > 0 and pred_1.numel() > 0 else 0
-        var_diff = torch.abs(pred_0.var() - pred_1.var()) if pred_0.numel() > 0 and pred_1.numel() > 0 else 0
-        return mean_diff + var_diff
-
 class FnRGNN(nn.Module):
-    def __init__(self, nfeat, hidden_dim, dropout, lm, ld, mmd_sample, lr, weight_decay,
+    def __init__(self, nfeat, hidden_dim, dropout, lm, gm, ld, mmd_sample, lr, weight_decay,
                  use_mmd=True, use_gwn=True, use_edge_weight=True):
         super(FnRGNN, self).__init__()
         self.hidden_dim = hidden_dim
         self.dropout = dropout
         self.lambda2 = lm
+        self.gamma = gm
         self.lambda_dist = ld
         self.mmd_sample_size = mmd_sample
 
@@ -810,9 +797,10 @@ class FnRGNN(nn.Module):
         self.gcn2 = GCNConv(hidden_dim, hidden_dim)
         self.classifier = nn.Linear(hidden_dim, 1)
 
-        self.group_norm = GroupWiseNorm()
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
         self.criterion = nn.MSELoss()
+        self.sinkhorn_loss_fn = SamplesLoss(loss="sinkhorn", p=2, blur=0.05, backend="tensorized") # Sinkhorn 정의 (epsilon = blur 제어)
+        # , backend="auto" : Linux에서..
 
     def compute_mmd(self, h, sensitive_attr):
         # adversarial loss 없이도 직접적인 distance loss로 추가 가능
@@ -841,17 +829,63 @@ class FnRGNN(nn.Module):
         xy = torch.exp(-torch.cdist(h_0, h_1) / (2 * sigma**2)).mean()
         return xx + yy - 2 * xy
 
+    def compute_edge(self, x, edge_index, sensitive_attr, sim_type='cosine'):
+        # 1. 노드 간 특성 유사도 계산
+        src, dst = edge_index
+        x_src = x[src]
+        x_dst = x[dst]
+
+        if sim_type == 'cosine':
+            sim = F.cosine_similarity(x_src, x_dst, dim=1)
+        elif sim_type == 'dot':
+            sim = torch.sum(x_src * x_dst, dim=1)
+        else:
+            raise ValueError("Unsupported sim_type. Use 'cosine' or 'dot'.")
+
+        # 2. 민감 속성 차이에 따라 감쇠
+        sen_diff = (sensitive_attr[src] != sensitive_attr[dst]).float()
+
+        # 3. 하이브리드 edge 가중치 계산
+        edge_weight = sim * torch.exp(-self.gamma * sen_diff)
+
+        # 4. 음수/NaN 방지
+        edge_weight = torch.clamp(edge_weight, min=1e-4)
+
+        return edge_weight
+
+    def compute_dist(self, pred, sensitive_attr):
+        # 민감 속성 그룹 간 분포가 다르다는 것은 bias가 있을 수 있다는 뜻이고, 이를 fairness 관점에서 줄이려는 것
+        # 두 그룹의 representation의 분포를 가깝게
+        mask_0 = (sensitive_attr == 0).squeeze()
+        mask_1 = (sensitive_attr == 1).squeeze()
+        pred_0 = pred[mask_0]
+        pred_1 = pred[mask_1]
+        mean_diff = torch.abs(pred_0.mean() - pred_1.mean()) if pred_0.numel() > 0 and pred_1.numel() > 0 else 0
+        var_diff = torch.abs(pred_0.var() - pred_1.var()) if pred_0.numel() > 0 and pred_1.numel() > 0 else 0
+        return mean_diff + var_diff
+
+    def compute_sinkhorn_loss(self, pred, sensitive_attr, sample_size=500):
+        pred_0 = pred[sensitive_attr == 0]
+        pred_1 = pred[sensitive_attr == 1]
+        if pred_0.size(0) == 0 or pred_1.size(0) == 0:
+            return torch.tensor(0.0, device=pred.device)
+        # Sample to reduce memory
+        if pred_0.size(0) > sample_size:
+            pred_0 = pred_0[torch.randperm(pred_0.size(0))[:sample_size]]
+        if pred_1.size(0) > sample_size:
+            pred_1 = pred_1[torch.randperm(pred_1.size(0))[:sample_size]]
+
+        return self.sinkhorn_loss_fn(pred_0, pred_1)
+
     def forward(self, data):
         x = data.x
         edge_index = data.edge_index
         sensitive_attr = data.sensitive_attr
 
-        num_edges = edge_index.size(1)
-        edge_weight = torch.ones(num_edges, device=x.device)
-
         if self.use_edge_weight:
-            sen_diff = sensitive_attr[edge_index[0]] != sensitive_attr[edge_index[1]]
-            edge_weight[sen_diff] *= 0.5  # 민감 속성 다른 엣지 가중치 감소
+            edge_weight = self.compute_edge(x, edge_index, sensitive_attr, sim_type='cosine')
+        else:
+            edge_weight = torch.ones(edge_index.size(1), device=x.device)
 
         h = self.gcn1(x, edge_index, edge_weight=edge_weight)
         h = F.relu(h)
@@ -860,6 +894,7 @@ class FnRGNN(nn.Module):
         h = F.relu(h)
         h = F.dropout(h, self.dropout, training=self.training)
         y = self.classifier(h)
+
         return y, h
 
     def optimize(self, data):
@@ -870,12 +905,17 @@ class FnRGNN(nn.Module):
 
         mse_loss = self.criterion(y, target)  # mse
         mmd_loss = self.compute_mmd(h, sensitive_attr) if self.use_mmd else torch.tensor(0.0, device=h.device) # mmd
-        gwn_loss  = self.group_norm(y, sensitive_attr) if self.use_gwn else torch.tensor(0.0, device=h.device) # mean + var diff
-        
+        gwn_loss  = self.compute_sinkhorn_loss(y, sensitive_attr) if self.use_gwn else torch.tensor(0.0, device=h.device) # mean + var diff
+        # self.compute_dist(y, sensitive_attr) if self.use_gwn else torch.tensor(0.0, device=h.device) # mean + var diff
         total_loss = mse_loss + self.lambda2 * mmd_loss + self.lambda_dist * gwn_loss 
         
         self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
 
-        return total_loss.item()
+        return {
+                'total_loss': total_loss.item(),
+                'mse_loss': mse_loss.item(),
+                'mmd_loss': mmd_loss.item(),
+                'gwn_loss': gwn_loss.item(),
+            }
