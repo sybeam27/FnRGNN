@@ -904,11 +904,15 @@ class FnRGNN(nn.Module):
         target = data.y.view(-1, 1)
 
         mse_loss = self.criterion(y, target)  # mse
-        mmd_loss = self.compute_mmd(h, sensitive_attr) if self.use_mmd else torch.tensor(0.0, device=h.device) # mmd
-        gwn_loss  = self.compute_sinkhorn_loss(y, sensitive_attr) if self.use_gwn else torch.tensor(0.0, device=h.device) # mean + var diff
-        # self.compute_dist(y, sensitive_attr) if self.use_gwn else torch.tensor(0.0, device=h.device) # mean + var diff
-        total_loss = mse_loss + self.lambda2 * mmd_loss + self.lambda_dist * gwn_loss 
-        
+        mmd_loss = self.compute_mmd(h, sensitive_attr) if self.use_mmd \
+        else torch.tensor(0.0, device=h.device, requires_grad=True)
+        gwn_loss_1 = self.compute_sinkhorn_loss(y, sensitive_attr) if self.use_gwn \
+        else torch.tensor(0.0, device=h.device, requires_grad=True)
+        gwn_loss_2 = self.compute_dist(y, sensitive_attr) if self.use_gwn \
+        else torch.tensor(0.0, device=h.device, requires_grad=True)
+        gwn_loss = gwn_loss_1 + gwn_loss_2
+        total_loss = mse_loss + self.lambda2 * mmd_loss + self.lambda_dist * gwn_loss
+
         self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
