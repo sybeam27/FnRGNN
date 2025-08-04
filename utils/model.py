@@ -79,70 +79,6 @@ def sparse_mx_to_torch_sparse_tensor(sparse_mx):
     shape = torch.Size(sparse_mx.shape)
     return torch.sparse.FloatTensor(indices, values, shape)
 
-# GAT 수정 필요함
-class GAT_body(nn.Module):
-    def __init__(self,
-                 num_layers,
-                 in_dim,
-                 num_hidden,
-                 heads,
-                 feat_drop,
-                 attn_drop,
-                 negative_slope,
-                 residual):
-        super(GAT_body, self).__init__()
-        self.num_layers = num_layers
-        self.gat_layers = nn.ModuleList()
-        self.activation = F.elu
-        # input projection (no residual)
-        self.gat_layers.append(GATConv(
-            in_dim, num_hidden, heads[0],
-            feat_drop, attn_drop, negative_slope, False, self.activation))
-        
-        # hidden layers
-        for l in range(1, num_layers):
-            # due to multi-head, the in_dim = num_hidden * num_heads
-            self.gat_layers.append(GATConv(
-                num_hidden * heads[l-1], num_hidden, heads[l],
-                feat_drop, attn_drop, negative_slope, residual, self.activation))
-        
-        # output projection
-        self.gat_layers.append(GATConv(
-            num_hidden * heads[-2], num_hidden, heads[-1],
-            feat_drop, attn_drop, negative_slope, residual, None))
-    
-    def forward(self, g, inputs):
-        h = inputs
-        for l in range(self.num_layers):
-            h = self.gat_layers[l](g, h).flatten(1)
-        
-        # output projection
-        logits = self.gat_layers[-1](g, h).mean(1)
-
-        return logits
-
-class GAT(nn.Module):
-    def __init__(self,
-                 num_layers,
-                 in_dim,
-                 num_hidden,
-                 num_classes,
-                 heads,
-                 feat_drop,
-                 attn_drop,
-                 negative_slope,
-                 residual):
-        super(GAT, self).__init__()
-
-        self.body = GAT_body(num_layers, in_dim, num_hidden, heads, feat_drop, attn_drop, negative_slope, residual)
-        self.fc = nn.Linear(num_hidden,num_classes)
-    
-    def forward(self, g, inputs):
-        logits = self.body(g,inputs)
-        logits = self.fc(logits)
-
-        return logits
-
 class GCN_Body(nn.Module):
     def __init__(self, nfeat, nhid, dropout):
         super(GCN_Body, self).__init__()
@@ -777,6 +713,76 @@ class GINRegressor(nn.Module):
         x = self.gin2(x, edge_index)
         return self.out(x).squeeze(-1)
 
+# REDRESS
+class GraphConvolution(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(GraphConvolution, self).__init__()
+        self.weight = Parameter(torch.FloatTensor(in_features, out_features))
+        self.bias = Parameter(torch.FloatTensor(out_features)) if bias else None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1. / self.weight.size(1)**0.5
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, adj):
+        support = torch.mm(input, self.weight)
+        output = torch.spmm(adj, support)
+        return output + self.bias if self.bias is not None else output
+
+def simi(output):
+    norm = output.norm(dim=1, keepdim=True)
+    norm = torch.where(norm == 0, torch.ones_like(norm), norm)
+    normed = output / norm
+    return 5 * (torch.mm(normed, normed.t()) + 1)
+
+def lambdas_computation(x_similarity, y_similarity, top_k, sigma=1e-2):
+    N = x_similarity.size(0)
+    max_val = 1e6
+    x_similarity[range(N), range(N)] = max_val
+    y_similarity[range(N), range(N)] = max_val
+
+    x_sorted_scores, _ = x_similarity.sort(dim=1, descending=True)
+    y_sorted_scores, y_sorted_idxs = y_similarity.sort(dim=1, descending=True)
+
+    y_sorted_scores = y_sorted_scores[:, 1:top_k+1]
+    y_sorted_idxs = y_sorted_idxs[:, 1:top_k+1]
+    x_corresponding = torch.stack([x_similarity[i, y_sorted_idxs[i]] for i in range(N)])
+
+    delta = y_sorted_scores.unsqueeze(2) - y_sorted_scores.unsqueeze(1)
+    frac = - sigma / (1 + (delta * sigma).exp())
+
+    x_delta = x_corresponding.unsqueeze(2) - x_corresponding.unsqueeze(1)
+    S_x = (x_delta >= 0).float()
+
+    ndcg_delta = torch.abs(delta)
+    grad = S_x * frac * ndcg_delta
+    lambdas = grad.sum(dim=1) - grad.sum(dim=2)
+
+    lambdas_full = torch.zeros_like(x_similarity)
+    rows = torch.arange(N).unsqueeze(1).expand(-1, top_k).reshape(-1)
+    cols = y_sorted_idxs.reshape(-1)
+    vals = lambdas.reshape(-1)
+    lambdas_full[rows, cols] = vals
+
+    return lambdas_full
+
+class GCN_REG(nn.Module):
+    def __init__(self, nfeat, nhid, out_dim=1, dropout=0.5):
+        super(GCN_REG, self).__init__()
+        self.gc1 = GraphConvolution(nfeat, nhid)
+        self.gc2 = GraphConvolution(nhid, out_dim)
+        self.dropout = dropout
+
+    def forward(self, x, adj):
+        x = self.gc1(x, adj)
+        x = F.relu(x)
+        x = F.dropout(x, self.dropout, training=self.training)
+        x = self.gc2(x, adj)
+        return x
+
 #FnR-GNN
 class FnRGNN(nn.Module):
     def __init__(self, nfeat, hidden_dim, dropout, lm, gm, ld, mmd_sample, lr, weight_decay,
@@ -923,3 +929,4 @@ class FnRGNN(nn.Module):
                 'mmd_loss': mmd_loss.item(),
                 'gwn_loss': gwn_loss.item(),
             }
+
