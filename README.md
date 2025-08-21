@@ -36,9 +36,9 @@ All datasets should be stored in the `datasets` folder, with each dataset placed
 
 ## Thanks to
 We extend our gratitude to the authors of the following libraries for generously sharing their source code and dataset:
-[FairGNN](https://github.com/EnyanDai/FairGNN)
-[FMP](https://github.com/zhimengj0326/FMP)
-[NIFTY](https://github.com/HongduanTian/NIFTY/tree/main)
+[FairGNN](https://github.com/EnyanDai/FairGNN),
+[FMP](https://github.com/zhimengj0326/FMP),
+[NIFTY](https://github.com/HongduanTian/NIFTY/tree/main).
 
 Your contributions are greatly appreciated.
 
